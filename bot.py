@@ -13,7 +13,7 @@ BAKONG_ACCOUNT_ID = "sin_soktep@bkrt"
 MERCHANT_NAME = "Soktep Book Store"
 MERCHANT_CITY = "Phnom Penh"
 # Note: You still need a Bakong API Token for MD5 verification to work
-BAKONG_API_TOKEN = "YOUR_BAKONG_OPEN_API_TOKEN" 
+BAKONG_API_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiM2VhMzg3OTRkMDJlNDZkYyJ9LCJpYXQiOjE3NjgyNzg0NzMsImV4cCI6MTc3NjA1NDQ3M30.gybhfjIvzzVCxbLUXHa5JPv6FaDtty1nEmZWBykfIrM" 
 
 # Initialize KHQR
 khqr = KHQR(BAKONG_API_TOKEN)
