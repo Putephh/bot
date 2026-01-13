@@ -1,2 +1,4 @@
 python-telegram-bot
-bakong-khqr[image]
+bakong-khqr
+qrcode[pil]
+pillow
