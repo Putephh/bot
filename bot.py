@@ -1,595 +1,485 @@
-import os
+import logging
+import qrcode
+import io
+import hashlib
+import time
+import requests
 import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-from bakong_khqr import KHQR
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
 
 load_dotenv()
 
-# ============ CONFIGURATION ============
-TELEGRAM_TOKEN = os.getenv("8502848831:AAG184UsX7tirVtPSCsAcjzPBN8_t4PQ42E")
-BAKONG_TOKEN = os.getenv("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiM2VhMzg3OTRkMDJlNDZkYyJ9LCJpYXQiOjE3NjgyNzg0NzMsImV4cCI6MTc3NjA1NDQ3M30.gybhfjIvzzVCxbLUXHa5JPv6FaDtty1nEmZWBykfIrM")  # Get from https://api-bakong.nbc.gov.kh/register or RBK from https://bakongrelay.com
-
-# Your Bakong account - format: username@bank
-# Get from: Bakong App → Profile → Account Information
-BANK_ACCOUNT = os.getenv("sin_soktep@bkrt")  # e.g., "myshop@wing"
-MERCHANT_NAME = os.getenv("MERCHANT_NAME", "My Bookshop")
+# ==========================================
+# CONFIGURATION
+# ==========================================
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8502848831:AAG184UsX7tirVtPSCsAcjzPBN8_t4PQ42E")
+BAKONG_TOKEN = os.getenv("BAKONG_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiM2VhMzg3OTRkMDJlNDZkYyJ9LCJpYXQiOjE3NjgyNzg0NzMsImV4cCI6MTc3NjA1NDQ3M30.gybhfjIvzzVCxbLUXHa5JPv6FaDtty1nEmZWBykfIrM")  # From https://api-bakong.nbc.gov.kh/register
+BAKONG_ACCOUNT_ID = os.getenv("BANK_ACCOUNT", "sin_soktep@bkrt")  # Format: username@bank
+MERCHANT_NAME = os.getenv("MERCHANT_NAME", "Book Shop KH")
 MERCHANT_CITY = os.getenv("MERCHANT_CITY", "Phnom Penh")
-PHONE_NUMBER = os.getenv("PHONE_NUMBER", "85581599652")
-STORE_LABEL = os.getenv("STORE_LABEL", "BookShop")
+CURRENCY_CODE = "840"  # 840 = USD, 116 = KHR
+TEST_PRICE = 0.01
 
-# Initialize KHQR with official bakong-khqr library
-try:
-    khqr = KHQR(BAKONG_TOKEN)
-    print("✅ KHQR Initialized successfully")
-except Exception as e:
-    print(f"❌ KHQR Initialization error: {e}")
-    khqr = None
+# Bakong API endpoints
+BAKONG_API_URL = "https://api-bakong.nbc.gov.kh"
+BAKONG_API_SANDBOX = "https://sit-api-bakong.nbc.gov.kh"  # For testing
 
-# Transaction storage
+# ==========================================
+# STATES FOR CONVERSATION
+# ==========================================
+NAME, PHONE, GROUP, PAYMENT = range(4)
+
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Storage for transactions (use database in production)
 transactions = {}
 
-# Book catalog with USD and KHR prices
-BOOKS = {
-    "b1": {"title": "Python Programming", "price_usd": 0.01, "price_khr": 50000, "author": "John Doe"},
-    "b2": {"title": "Web Development", "price_usd": 0.01, "price_khr": 50000, "author": "Jane Smith"},
-    "b3": {"title": "Data Science", "price_usd": 0.01, "price_khr": 50000, "author": "Bob Johnson"},
-}
+# ==========================================
+# KHQR GENERATOR (EMVCo Standard + Bakong Format)
+# ==========================================
 
-# Conversation states
-REQUESTING_NAME, REQUESTING_PHONE, REQUESTING_GROUP, REQUESTING_CURRENCY = range(4)
+def calculate_crc16(data: str) -> str:
+    """Calculates CRC16 (CCITT-FALSE) for KHQR."""
+    crc = 0xFFFF
+    for char in data:
+        code = ord(char)
+        crc ^= code << 8
+        for _ in range(8):
+            if (crc & 0x8000) > 0:
+                crc = (crc << 1) ^ 0x1021
+            else:
+                crc = crc << 1
+            crc &= 0xFFFF
+    return f"{crc:04X}"
 
-# ============ KHQR PAYMENT FUNCTIONS ============
-
-def create_payment_qr(bank_account, amount, currency, bill_number):
+def generate_khqr_string(account_id: str, amount: float, bill_number: str) -> str:
     """
-    Create real KHQR QR code using official Bakong API
-    
-    Parameters:
-    - bank_account: Format "username@bank" (e.g., "shop@wing")
-    - amount: Amount in currency (float)
-    - currency: "KHR" or "USD"
-    - bill_number: Unique bill/transaction reference
+    Generates a complete KHQR string compatible with Bakong standard.
+    Format: EMVCo with Bakong merchant information
     """
-    if not khqr:
-        return None
+    # 1. Payload Format Indicator (00) = 01
+    root = "000201"
     
-    try:
-        qr_string = khqr.create_qr(
-            bank_account=bank_account,
-            merchant_name=MERCHANT_NAME,
-            merchant_city=MERCHANT_CITY,
-            amount=amount,  # Amount in currency
-            currency=currency,  # KHR or USD
-            store_label=STORE_LABEL,
-            phone_number=PHONE_NUMBER,
-            bill_number=bill_number,
-            terminal_label="Cashier-01",
-            static=False  # Dynamic QR (expires after payment or timeout)
-        )
-        return qr_string
-    except Exception as e:
-        print(f"❌ Error creating QR: {e}")
-        return None
-
-def get_md5_hash(qr_string):
-    """Generate MD5 hash from QR string for payment verification"""
-    if not khqr:
-        return None
+    # 2. Point of Initiation (01) = 12 (Dynamic/Online)
+    root += "010212"
     
-    try:
-        md5 = khqr.generate_md5(qr_string)
-        return md5
-    except Exception as e:
-        print(f"❌ Error generating MD5: {e}")
-        return None
+    # 3. Merchant Account Information (29 for Bakong)
+    # Format: 29{len}0006bakong01{len}{account_id}
+    merchant_info = f"0006bakong01{len(account_id):02}{account_id}"
+    root += f"29{len(merchant_info):02}{merchant_info}"
+    
+    # 4. Merchant Category Code (52) = 5942 (Book Stores)
+    root += "52045942"
+    
+    # 5. Transaction Currency (53) = 840 (USD) or 116 (KHR)
+    root += f"5303{CURRENCY_CODE}"
+    
+    # 6. Transaction Amount (54)
+    amount_str = f"{amount:.2f}"
+    root += f"54{len(amount_str):02}{amount_str}"
+    
+    # 7. Country Code (58) = KH
+    root += "5802KH"
+    
+    # 8. Merchant Name (59)
+    root += f"59{len(MERCHANT_NAME):02}{MERCHANT_NAME}"
+    
+    # 9. Merchant City (60)
+    root += f"60{len(MERCHANT_CITY):02}{MERCHANT_CITY}"
+    
+    # 10. Additional Data Field Template (62)
+    # Sub-tag 07: Bill Number/Transaction Reference
+    additional_data = f"07{len(bill_number):02}{bill_number}"
+    root += f"62{len(additional_data):02}{additional_data}"
+    
+    # 11. CRC (63) - Always placeholder first
+    root += "6304"
+    
+    # Calculate and append actual CRC
+    crc = calculate_crc16(root)
+    return root + crc
 
-def check_payment_status(md5_hash):
+def generate_md5_hash(account_id: str, amount: float, bill_number: str, timestamp: int) -> str:
+    """Generate MD5 hash for payment verification"""
+    raw_str = f"{account_id}{amount}{bill_number}{timestamp}"
+    return hashlib.md5(raw_str.encode()).hexdigest()
+
+# ==========================================
+# BAKONG API FUNCTIONS (REAL PAYMENT VERIFICATION)
+# ==========================================
+
+def check_payment_with_bakong(md5_hash: str) -> dict:
     """
-    Check payment status from Bakong API
-    Returns: "PAID", "UNPAID", or error
+    Check payment status using actual Bakong API.
+    Requires BAKONG_TOKEN from https://api-bakong.nbc.gov.kh/register
     """
-    if not khqr:
-        return "ERROR"
+    if not BAKONG_TOKEN or BAKONG_TOKEN == "YOUR_BAKONG_TOKEN":
+        logger.warning("⚠️ BAKONG_TOKEN not set. Using simulation mode.")
+        return {"status": "PENDING", "message": "Using simulation (no real token)"}
     
     try:
-        status = khqr.check_payment(md5_hash)
-        return status  # Returns "PAID" or "UNPAID"
+        # Bakong API endpoint to check payment
+        url = f"{BAKONG_API_URL}/v1/check_transaction_status"
+        
+        headers = {
+            "Authorization": f"Bearer {BAKONG_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "md5": md5_hash
+        }
+        
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        response_data = response.json()
+        
+        logger.info(f"Bakong API response: {response_data}")
+        
+        if response_data.get("status") == "00":
+            # Status 00 = Success/Paid
+            return {
+                "status": "PAID",
+                "message": "Payment confirmed!",
+                "data": response_data.get("data", {})
+            }
+        else:
+            return {
+                "status": "UNPAID",
+                "message": "Payment not yet received",
+                "data": response_data.get("data", {})
+            }
     except Exception as e:
-        print(f"❌ Error checking payment: {e}")
-        return "ERROR"
+        logger.error(f"❌ Bakong API error: {e}")
+        return {"status": "ERROR", "message": str(e)}
 
-def get_payment_details(md5_hash):
-    """Get detailed payment information after successful payment"""
-    if not khqr:
-        return None
+def simulate_payment_check(md5_hash: str, timestamp: int) -> dict:
+    """Simulate payment check when Bakong API is not available"""
+    current_time = int(time.time())
+    elapsed = current_time - timestamp
     
-    try:
-        payment_info = khqr.get_payment(md5_hash)
-        return payment_info
-    except Exception as e:
-        print(f"❌ Error getting payment details: {e}")
-        return None
+    # Check expiration (10 minutes = 600 seconds)
+    if elapsed > 600:
+        return {"status": "EXPIRED", "message": "Payment request expired"}
+    
+    # Simulate: if more than 3 seconds passed, assume payment received (for testing)
+    if elapsed > 3:
+        return {"status": "PAID", "message": "Payment verified"}
+    
+    return {"status": "PENDING", "message": "Waiting for payment..."}
 
-def generate_qr_image(qr_string):
-    """Generate QR image as PNG from QR string"""
-    if not khqr:
-        return None
-    
-    try:
-        png_path = khqr.qr_image(qr_string, format='png')
-        return png_path
-    except Exception as e:
-        print(f"❌ Error generating QR image: {e}")
-        return None
+# ==========================================
+# BOT FUNCTIONS
+# ==========================================
 
-# ============ BOT HANDLERS ============
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
-    if not khqr:
-        await update.message.reply_text(
-            "❌ Bot is not configured properly. Missing BAKONG_TOKEN or cannot connect to Bakong API.\n\n"
-            "Solution: Use RBK Token from https://bakongrelay.com/ if you're outside Cambodia"
-        )
-        return
-    
-    user = update.effective_user
-    
-    keyboard = [
-        [InlineKeyboardButton("📚 Browse Books", callback_data="browse")],
-        [InlineKeyboardButton("💳 How to Pay", callback_data="about")],
-        [InlineKeyboardButton("❓ FAQ", callback_data="faq")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Starts the conversation."""
     await update.message.reply_text(
-        f"Welcome to {MERCHANT_NAME}! 📖\n\n"
-        f"Hi {user.first_name}! 👋\n\n"
-        f"We accept KHQR payment from any bank in Cambodia.\n"
-        f"Simple, fast, and secure! 🔒",
-        reply_markup=reply_markup
-    )
-
-async def browse_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show book catalog"""
-    query = update.callback_query
-    await query.answer()
-    
-    keyboard = []
-    for book_id, book_info in BOOKS.items():
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{book_info['title']} - ${book_info['price_usd']} / {book_info['price_khr']}៛",
-                callback_data=f"select_{book_id}"
-            )
-        ])
-    
-    keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="back_menu")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "📚 *Available Books:*\n\n(Select a book to continue)",
-        reply_markup=reply_markup,
+        f"📚 Welcome to {MERCHANT_NAME}!\n\n"
+        f"📖 Product: Python Masterclass PDF\n"
+        f"💰 Price: ${TEST_PRICE} USD\n\n"
+        "Let's get started! Please enter your **name**:",
         parse_mode="Markdown"
     )
+    return NAME
 
-async def select_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Select book and choose currency"""
-    query = update.callback_query
-    book_id = query.data.split("_")[1]
-    
-    book = BOOKS[book_id]
-    context.user_data["selected_book"] = book_id
-    
-    keyboard = [
-        [InlineKeyboardButton(f"💵 USD ${book['price_usd']}", callback_data=f"currency_USD_{book_id}")],
-        [InlineKeyboardButton(f"💴 KHR {book['price_khr']}៛", callback_data=f"currency_KHR_{book_id}")],
-        [InlineKeyboardButton("◀️ Back", callback_data="browse")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.answer()
-    await query.edit_message_text(
-        f"📖 *{book['title']}*\n"
-        f"Author: {book['author']}\n\n"
-        f"Select payment currency:",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
-    )
-
-async def select_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Select currency and request name"""
-    query = update.callback_query
-    data_parts = query.data.split("_")
-    currency = data_parts[1]
-    book_id = data_parts[2]
-    
-    book = BOOKS[book_id]
-    amount = book['price_usd'] if currency == "USD" else book['price_khr']
-    
-    context.user_data["currency"] = currency
-    context.user_data["amount"] = amount
-    context.user_data["selected_book"] = book_id
-    
-    await query.answer()
-    await query.edit_message_text("Please enter your *name*:", parse_mode="Markdown")
-    
-    return REQUESTING_NAME
-
-async def name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process name and request phone"""
+async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Get customer name"""
     context.user_data["name"] = update.message.text
     
     keyboard = [
-        [InlineKeyboardButton("✅ Yes, share my number", callback_data="phone_yes")],
-        [InlineKeyboardButton("⏭️  Skip", callback_data="phone_skip")]
+        [InlineKeyboardButton("✅ Yes, share it", callback_data="phone_yes")],
+        [InlineKeyboardButton("⏭️ Skip", callback_data="phone_skip")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
+        f"Nice to meet you, {context.user_data['name']}! 👋\n\n"
         "Would you like to share your phone number? (Optional)",
         reply_markup=reply_markup
     )
-    
-    return REQUESTING_PHONE
+    return PHONE
 
-async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle phone option"""
     query = update.callback_query
     await query.answer()
     
     if query.data == "phone_yes":
-        await query.edit_message_text("Please enter your *phone number*:", parse_mode="Markdown")
-        return REQUESTING_PHONE
+        await query.edit_message_text("Please enter your **phone number**:", parse_mode="Markdown")
+        return PHONE
     else:
         context.user_data["phone"] = "Not provided"
-        return await request_category(update, context)
+        await query.edit_message_text("Got it! Please enter your **group** (e.g., Class A, Group 1):", parse_mode="Markdown")
+        return GROUP
 
-async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process phone and request category"""
+async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Get phone number"""
     context.user_data["phone"] = update.message.text
-    return await request_category(update, context)
+    await update.message.reply_text(
+        "Thanks! Now, please enter your **group** (e.g., Class A, Group 1):",
+        parse_mode="Markdown"
+    )
+    return GROUP
 
-async def request_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Request book category preference"""
-    keyboard = [
-        [InlineKeyboardButton("📕 Fiction", callback_data="cat_fiction")],
-        [InlineKeyboardButton("📗 Non-Fiction", callback_data="cat_nonfiction")],
-        [InlineKeyboardButton("📘 Educational", callback_data="cat_educational")],
-        [InlineKeyboardButton("⏭️  Skip", callback_data="cat_skip")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+async def get_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Get group and generate payment QR"""
+    context.user_data["group"] = update.message.text
     
-    if hasattr(update, 'message') and update.message:
-        await update.message.reply_text(
-            "What's your preferred book category?",
-            reply_markup=reply_markup
-        )
-    else:
-        await update.callback_query.edit_message_text(
-            "What's your preferred book category?",
-            reply_markup=reply_markup
-        )
+    # Generate transaction data
+    user_info = context.user_data
+    timestamp = int(time.time())
+    bill_number = f"BILL{timestamp}"
     
-    return REQUESTING_GROUP
-
-async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate KHQR payment after category selection"""
-    query = update.callback_query
-    category = query.data.split("_")[1] if query.data != "cat_skip" else "general"
-    context.user_data["category"] = category
+    context.user_data["timestamp"] = timestamp
+    context.user_data["bill_number"] = bill_number
     
-    await query.answer()
+    # Generate MD5 hash for verification
+    md5_hash = generate_md5_hash(BAKONG_ACCOUNT_ID, TEST_PRICE, bill_number, timestamp)
+    context.user_data["md5_hash"] = md5_hash
     
-    # Generate unique bill number
-    bill_number = f"BILL{int(datetime.now().timestamp())}"
-    amount = context.user_data["amount"]
-    currency = context.user_data["currency"]
+    logger.info(f"Generated transaction: Bill={bill_number}, MD5={md5_hash}, User={user_info['name']}")
     
-    # Create KHQR QR code
-    qr_string = create_payment_qr(BANK_ACCOUNT, amount, currency, bill_number)
-    
-    if not qr_string:
-        await query.edit_message_text(
-            "❌ *Error* generating payment QR code\n\n"
-            "Troubleshooting:\n"
-            "1. Check BAKONG_TOKEN is valid\n"
-            "2. If outside Cambodia, use RBK Token from bakongrelay.com\n"
-            "3. Check BANK_ACCOUNT format (username@bank)\n\n"
-            "For help, contact support.",
-            parse_mode="Markdown"
-        )
-        return
-    
-    # Get MD5 hash
-    md5_hash = get_md5_hash(qr_string)
-    
-    if not md5_hash:
-        await query.edit_message_text("❌ Error generating payment hash. Please try again.")
-        return
-    
-    # Store transaction
-    expires_at = datetime.now() + timedelta(minutes=10)
+    # Store transaction info (for production use database)
     transactions[md5_hash] = {
-        "amount": amount,
-        "currency": currency,
         "user_id": update.effective_user.id,
-        "name": context.user_data.get("name"),
-        "phone": context.user_data.get("phone"),
-        "category": category,
-        "bill_number": bill_number,
-        "qr_string": qr_string,
-        "expires_at": expires_at,
-        "created_at": datetime.now(),
-        "status": "UNPAID"
+        "name": user_info['name'],
+        "phone": user_info.get('phone', 'N/A'),
+        "group": user_info['group'],
+        "amount": TEST_PRICE,
+        "timestamp": timestamp,
+        "expires_at": timestamp + 600,  # 10 minutes
+        "status": "PENDING"
     }
     
-    currency_symbol = "$" if currency == "USD" else "៛"
+    # Generate KHQR string
+    khqr_data = generate_khqr_string(BAKONG_ACCOUNT_ID, TEST_PRICE, bill_number)
+    logger.info(f"KHQR generated: {khqr_data[:50]}...")
     
-    # Payment details message
-    message_text = (
-        f"💳 *KHQR Payment*\n\n"
-        f"📋 *Details:*\n"
-        f"Amount: {amount}{currency_symbol}\n"
-        f"Bill No: `{bill_number}`\n"
-        f"MD5: `{md5_hash}`\n"
-        f"Name: {context.user_data.get('name')}\n"
-        f"Phone: {context.user_data.get('phone', 'Not provided')}\n"
-        f"Category: {category}\n\n"
-        f"⏰ *Expires in: 10 minutes*\n\n"
-        f"📱 *Scan with your bank app to pay:*"
-    )
+    # Create QR image
+    qr = qrcode.QRCode(box_size=10, border=4)
+    qr.add_data(khqr_data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
     
+    # Save to buffer
+    bio = io.BytesIO()
+    bio.name = 'qr.png'
+    img.save(bio, 'PNG')
+    bio.seek(0)
+    
+    # Payment verification buttons
     keyboard = [
-        [InlineKeyboardButton("✅ I've Paid", callback_data=f"check_{md5_hash}")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_order")]
+        [InlineKeyboardButton("✅ I have Paid", callback_data=f"check_status_{md5_hash}")],
+        [InlineKeyboardButton("⏱️ Check Status Again", callback_data=f"check_status_{md5_hash}")],
+        [InlineKeyboardButton("❌ Cancel Order", callback_data="cancel")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(message_text, parse_mode="Markdown")
-    
-    # Generate and send QR image
-    qr_image_path = generate_qr_image(qr_string)
-    
-    if qr_image_path and os.path.exists(qr_image_path):
-        try:
-            with open(qr_image_path, 'rb') as photo:
-                await query.message.reply_photo(
-                    photo=photo,
-                    caption=(
-                        f"🔐 Scan this QR code with your mobile banking app\n\n"
-                        f"Supported banks: WING, ABA, BIDC, Acleda, etc.\n"
-                        f"Amount: {amount}{currency_symbol}"
-                    ),
-                    reply_markup=reply_markup
-                )
-        except Exception as e:
-            print(f"Error sending QR image: {e}")
-            await query.message.reply_text(
-                "QR code ready (image send failed, but you can use the QR string above)",
-                reply_markup=reply_markup
-            )
-    else:
-        await query.message.reply_text(
-            f"QR String:\n`{qr_string}`",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
-    
-    context.user_data["current_md5"] = md5_hash
 
-async def check_payment_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check payment status from Bakong"""
-    query = update.callback_query
-    md5_hash = query.data.split("_")[1]
-    
-    await query.answer("Checking payment status...", show_alert=False)
-    
-    # Check payment status
-    status = check_payment_status(md5_hash)
-    
-    # Get payment details if paid
-    payment_details = None
-    if status == "PAID":
-        payment_details = get_payment_details(md5_hash)
-        transactions[md5_hash]["status"] = "PAID"
-    
-    emoji_map = {"PAID": "✅", "UNPAID": "⏳", "ERROR": "❌"}
-    emoji = emoji_map.get(status, "❓")
-    
-    message_text = f"{emoji} *Payment Status: {status}*\n\n"
-    message_text += f"MD5: `{md5_hash}`\n"
-    
-    if payment_details:
-        message_text += (
-            f"\n💰 *Payment Info:*\n"
-            f"From: {payment_details.get('fromAccountId', 'N/A')}\n"
-            f"Amount: {payment_details.get('amount', 'N/A')} {payment_details.get('currency', 'KHR')}\n"
-            f"Date: {datetime.fromtimestamp(payment_details.get('acknowledgedDateMs', 0) / 1000)}\n"
-        )
-    
-    if status == "PAID":
-        keyboard = [
-            [InlineKeyboardButton("🏠 Back Home", callback_data="back_menu")],
-            [InlineKeyboardButton("📚 Buy More", callback_data="browse")]
-        ]
-    else:
-        keyboard = [
-            [InlineKeyboardButton("🔄 Check Again", callback_data=f"check_{md5_hash}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_order")]
-        ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        message_text,
+    await update.message.reply_photo(
+        photo=bio,
+        caption=(
+            f"🧾 **KHQR PAYMENT**\n\n"
+            f"👤 Name: {user_info['name']}\n"
+            f"📞 Phone: {user_info.get('phone', 'N/A')}\n"
+            f"👥 Group: {user_info['group']}\n"
+            f"💰 Amount: ${TEST_PRICE} USD\n"
+            f"📋 Bill No: `{bill_number}`\n"
+            f"🔐 Hash: `{md5_hash[:12]}...`\n\n"
+            f"📱 **Scan with your bank app:**\n"
+            f"• ABA Pay\n"
+            f"• Acleda Mobile\n"
+            f"• WING\n"
+            f"• Any Bakong-enabled bank\n\n"
+            f"⏳ **Expires in: 10 minutes**"
+        ),
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
+    return PAYMENT
 
-async def back_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Go back to main menu"""
+async def check_payment_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Check payment status using Bakong API"""
     query = update.callback_query
     await query.answer()
     
-    keyboard = [
-        [InlineKeyboardButton("📚 Browse Books", callback_data="browse")],
-        [InlineKeyboardButton("💳 How to Pay", callback_data="about")],
-        [InlineKeyboardButton("❓ FAQ", callback_data="faq")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    md5_hash = query.data.split("_")[2]
     
-    await query.edit_message_text(
-        f"Welcome to {MERCHANT_NAME}! 📖\n\n"
-        f"We accept KHQR payment from any bank in Cambodia.",
-        reply_markup=reply_markup
-    )
-
-async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show how to pay"""
-    query = update.callback_query
-    await query.answer()
+    # Get transaction data
+    txn = transactions.get(md5_hash, {})
+    saved_time = txn.get("timestamp", 0)
+    current_time = int(time.time())
+    expires_at = txn.get("expires_at", 0)
     
-    keyboard = [[InlineKeyboardButton("◀️ Back", callback_data="back_menu")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # 1. Check Expiration
+    if current_time > expires_at:
+        await query.edit_message_caption(
+            caption=(
+                "⚠️ **PAYMENT EXPIRED**\n\n"
+                "The payment request has expired (10 minutes limit).\n"
+                "Please start a new order with `/start`"
+            ),
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
     
-    await query.edit_message_text(
-        "💳 *How to Pay with KHQR:*\n\n"
-        "1️⃣ Select a book and currency\n"
-        "2️⃣ Enter your name and phone\n"
-        "3️⃣ We generate a KHQR QR code\n"
-        "4️⃣ Scan with your bank app (WING, ABA, BIDC, etc.)\n"
-        "5️⃣ Complete the payment\n"
-        "6️⃣ Click 'I've Paid' to confirm\n\n"
-        "✅ Simple, fast, secure!\n"
-        "🔒 All banks in Cambodia supported",
-        reply_markup=reply_markup,
+    # Show loading message
+    await query.edit_message_caption(
+        caption="🔄 **Verifying payment with bank...**\n\nPlease wait...",
         parse_mode="Markdown"
     )
-
-async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show FAQ"""
-    query = update.callback_query
-    await query.answer()
     
-    keyboard = [[InlineKeyboardButton("◀️ Back", callback_data="back_menu")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # 2. Check payment status with Bakong API or simulation
+    if BAKONG_TOKEN and BAKONG_TOKEN != "YOUR_BAKONG_TOKEN":
+        # Real API call
+        result = check_payment_with_bakong(md5_hash)
+    else:
+        # Simulation mode (for testing without token)
+        result = simulate_payment_check(md5_hash, saved_time)
     
-    await query.edit_message_text(
-        "❓ *Frequently Asked Questions:*\n\n"
-        "*Q: What is KHQR?*\n"
-        "A: KHQR is Cambodia's official QR payment code.\n\n"
-        "*Q: Which banks are supported?*\n"
-        "A: All Cambodian banks (WING, ABA, BIDC, Acleda, etc.)\n\n"
-        "*Q: Is it secure?*\n"
-        "A: Yes! KHQR is encrypted and verified by Bakong.\n\n"
-        "*Q: How long is the payment valid?*\n"
-        "A: 10 minutes from generation.\n\n"
-        "*Q: What if payment expires?*\n"
-        "A: Generate a new QR code.\n\n"
-        "📞 Support: Contact merchant directly",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
-    )
+    logger.info(f"Payment check result: {result}")
+    
+    # 3. Handle results
+    if result["status"] == "PAID":
+        # Success!
+        transactions[md5_hash]["status"] = "PAID"
+        
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                f"✅ **PAYMENT RECEIVED!**\n\n"
+                f"Thank you {context.user_data['name']} 🎉\n\n"
+                f"📚 Here is your book:\n"
+                f"[📥 Download Python Masterclass PDF](https://www.python.org/doc/)\n\n"
+                f"📋 **Order Details:**\n"
+                f"• Bill No: `{context.user_data['bill_number']}`\n"
+                f"• Amount: ${TEST_PRICE}\n"
+                f"• Hash: `{md5_hash[:12]}...`\n\n"
+                f"Thank you for your purchase! 🙏"
+            ),
+            parse_mode="Markdown"
+        )
+        
+        return ConversationHandler.END
+    
+    elif result["status"] == "PENDING":
+        # Still waiting
+        await query.edit_message_caption(
+            caption=(
+                "⏳ **PAYMENT PENDING**\n\n"
+                "We haven't received your payment yet.\n"
+                "Please complete the payment and click below to check again.\n\n"
+                "⏱️ Time remaining: ~"
+                f"{(expires_at - current_time) // 60} minutes"
+            ),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Check Again", callback_data=f"check_status_{md5_hash}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+            ])
+        )
+        return PAYMENT
+    
+    elif result["status"] == "EXPIRED":
+        # Expired
+        await query.edit_message_caption(
+            caption=(
+                "⚠️ **PAYMENT EXPIRED**\n\n"
+                "Your payment request has expired.\n"
+                "Please start a new order."
+            ),
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    
+    else:
+        # Error
+        await query.edit_message_caption(
+            caption=(
+                "❌ **ERROR CHECKING PAYMENT**\n\n"
+                f"Error: {result.get('message', 'Unknown error')}\n\n"
+                "Please try again or contact support."
+            ),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Try Again", callback_data=f"check_status_{md5_hash}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+            ])
+        )
+        return PAYMENT
 
-async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel order"""
     query = update.callback_query
     await query.answer()
     
-    keyboard = [[InlineKeyboardButton("📚 Browse Books", callback_data="browse")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "❌ Order cancelled.",
-        reply_markup=reply_markup
+    await query.edit_message_caption(
+        caption=(
+            "🚫 **ORDER CANCELLED**\n\n"
+            "Your order has been cancelled.\n"
+            "You can start a new order with `/start`"
+        ),
+        parse_mode="Markdown"
     )
+    return ConversationHandler.END
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main callback handler"""
-    query = update.callback_query
-    data = query.data
-    
-    if data == "browse":
-        await browse_books(update, context)
-    elif data.startswith("select_"):
-        await select_book(update, context)
-    elif data.startswith("currency_"):
-        return await select_currency(update, context)
-    elif data.startswith("check_"):
-        await check_payment_status_handler(update, context)
-    elif data == "back_menu":
-        await back_menu(update, context)
-    elif data == "about":
-        await about(update, context)
-    elif data == "faq":
-        await faq(update, context)
-    elif data == "cancel_order":
-        await cancel_order(update, context)
-    elif data in ["phone_yes", "phone_skip"]:
-        return await handle_phone(update, context)
-    elif data.startswith("cat_"):
-        return await category_selected(update, context)
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text input"""
-    user_state = context.user_data.get('conversation_state')
-    
-    if user_state == REQUESTING_NAME:
-        return await name_received(update, context)
-    elif user_state == REQUESTING_PHONE:
-        return await phone_received(update, context)
-
-# ============ MAIN ============
-
-def main():
-    """Start the bot"""
-    if not TELEGRAM_TOKEN or not BAKONG_TOKEN or not BANK_ACCOUNT:
-        print("❌ Missing required environment variables!")
-        print("Required:")
-        print("  TELEGRAM_BOT_TOKEN - from @BotFather")
-        print("  BAKONG_TOKEN - from https://api-bakong.nbc.gov.kh/register or RBK from https://bakongrelay.com")
-        print("  BANK_ACCOUNT - format: username@bank (e.g., myshop@wing)")
+def main() -> None:
+    """Run the bot"""
+    if not TOKEN or TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+        logger.error("❌ TELEGRAM_BOT_TOKEN not set in .env")
         return
     
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    logger.info("=" * 60)
+    logger.info("🤖 Telegram KHQR Bookshop Bot")
+    logger.info("=" * 60)
+    logger.info(f"✅ Bot Token: {TOKEN[:20]}...")
+    logger.info(f"✅ Bank Account: {BAKONG_ACCOUNT_ID}")
+    if BAKONG_TOKEN and BAKONG_TOKEN != "YOUR_BAKONG_TOKEN":
+        logger.info(f"✅ Bakong API: ENABLED")
+    else:
+        logger.info(f"⚠️ Bakong API: DISABLED (using simulation mode)")
+    logger.info("=" * 60)
+    logger.info("🚀 Bot is running...")
+    logger.info("=" * 60)
     
-    # Conversation handler
+    application = Application.builder().token(TOKEN).build()
+
     conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(select_currency, pattern="^currency_"),
-        ],
+        entry_points=[CommandHandler("start", start)],
         states={
-            REQUESTING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, name_received)],
-            REQUESTING_PHONE: [
-                CallbackQueryHandler(handle_phone, pattern="^phone_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, phone_received)
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
+            PHONE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone),
+                CallbackQueryHandler(handle_phone, pattern="^phone_")
             ],
-            REQUESTING_GROUP: [CallbackQueryHandler(category_selected, pattern="^cat_")],
+            GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_group)],
+            PAYMENT: [
+                CallbackQueryHandler(check_payment_status, pattern="^check_status_"),
+                CallbackQueryHandler(cancel, pattern="^cancel$")
+            ]
         },
-        fallbacks=[CommandHandler("start", start)]
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
+
+    application.add_handler(conv_handler)
     
-    # Add handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    
-    print("=" * 60)
-    print("🤖 Telegram Bookshop Bot with KHQR Payment")
-    print("=" * 60)
-    print(f"✅ Bot Token: {TELEGRAM_TOKEN[:20]}...")
-    print(f"✅ Bakong Token: {BAKONG_TOKEN[:20]}...")
-    print(f"✅ Bank Account: {BANK_ACCOUNT}")
-    print(f"✅ KHQR Library: Loaded")
-    print("=" * 60)
-    print("🚀 Bot is running... Press Ctrl+C to stop")
-    print("=" * 60)
-    
-    app.run_polling()
+    # Run the bot
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
