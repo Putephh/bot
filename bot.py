@@ -18,7 +18,7 @@ from telegram.ext import (
 # CONFIGURATION
 # ==========================================
 TOKEN = "8502848831:AAG184UsX7tirVtPSCsAcjzPBN8_t4PQ42E"
-BAKONG_ACCOUNT_ID = "sin_soktep@bkrt" 
+BAKONG_ACCOUNT_ID = "005927335" 
 MERCHANT_NAME = "Soktep Book Store"
 MERCHANT_CITY = "Phnom Penh"
 TEST_PRICE = 0.01
