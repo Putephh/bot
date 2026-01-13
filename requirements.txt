@@ -1,4 +1,5 @@
 python-telegram-bot
-bakong-khqr
+bakong-khqr==0.1.4
 qrcode[pil]
 pillow
+requests
