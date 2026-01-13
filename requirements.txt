@@ -1,4 +1,3 @@
 python-telegram-bot
 bakong-khqr
 qrcode[pil]
-pillow
