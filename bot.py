@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fixed Telegram Book Shop Bot with proper KHQR integration
+Telegram Book Shop Bot with REAL KHQR Payments - CORRECT VERSION
 """
 
 import os
@@ -35,27 +35,35 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# Try to import bakong-khqr, but have fallback
+# Try to import bakong_khqr CORRECTLY
 try:
     from bakong_khqr import KHQR
     KHQR_AVAILABLE = True
-    print("✅ KHQR library imported successfully")
+    print("✅ KHQR library imported successfully using: from bakong_khqr import KHQR")
 except ImportError as e:
-    print(f"⚠️  KHQR library not available: {e}")
-    print("ℹ️  Install with: pip install bakong-khqr[image]")
+    print(f"❌ KHQR import error: {e}")
     KHQR_AVAILABLE = False
+    print("Run: pip3 install bakong-khqr")
 except Exception as e:
-    print(f"⚠️  Error importing KHQR: {e}")
+    print(f"❌ Other import error: {e}")
     KHQR_AVAILABLE = False
 
-# For fallback QR code
+# For QR image
 import qrcode
-from PIL import Image
+from PIL import Image, ImageDraw
+import hashlib
 
 # ===================== CONFIGURATION =====================
 TOKEN = os.getenv('TOKEN', '8502848831:AAG184UsX7tirVtPSCsAcjzPBN8_t4PQ42E')
 ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '1273972944').split(',')]
-BAKONG_TOKEN = os.getenv('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiM2VhMzg3OTRkMDJlNDZkYyJ9LCJpYXQiOjE3NjgyNzg0NzMsImV4cCI6MTc3NjA1NDQ3M30.gybhfjIvzzVCxbLUXHa5JPv6FaDtty1nEmZWBykfIrM', '')  # Your Bakong token
+BAKONG_TOKEN = os.getenv('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiM2VhMzg3OTRkMDJlNDZkYyJ9LCJpYXQiOjE3NjgyNzg0NzMsImV4cCI6MTc3NjA1NDQ3M30.gybhfjIvzzVCxbLUXHa5JPv6FaDtty1nEmZWBykfIrM', '')  # REQUIRED: Get from api-bakong.nbc.gov.kh
+
+# KHQR Configuration
+BAKONG_ACCOUNT = os.getenv('BAKONG_ACCOUNT', 'sin_soktep@bkrt')  # Your Bakong account (e.g., yourname@aba)
+MERCHANT_NAME = "Classmate Book Shop"
+MERCHANT_CITY = "Phnom Penh"
+STORE_LABEL = "Telegram Book Shop"
+PHONE_NUMBER = "85581599652"  # Your store phone
 
 # Create necessary directories
 os.makedirs('payment_images', exist_ok=True)
@@ -92,7 +100,7 @@ PRODUCTS = {
 (
     CHOOSING, SELECT_PRODUCT, GET_QUANTITY, 
     GET_NAME, GET_GROUP, GET_PHONE, 
-    PAYMENT, UPLOAD_SCREENSHOT
+    PAYMENT, WAITING_PAYMENT
 ) = range(8)
 
 # Setup logging
@@ -105,7 +113,7 @@ logger = logging.getLogger(__name__)
 # ===================== SIMPLE DATABASE =====================
 class SimpleDB:
     def __init__(self):
-        self.conn = sqlite3.connect('bookshop.db', check_same_thread=False)
+        self.conn = sqlite3.connect('bookshop_payments.db', check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.create_tables()
     
@@ -120,49 +128,88 @@ class SimpleDB:
                 phone TEXT,
                 product_name TEXT,
                 quantity INTEGER,
+                amount REAL,
                 total_amount REAL,
+                currency TEXT,
                 payment_status TEXT DEFAULT 'pending',
                 khqr_data TEXT,
                 khqr_md5 TEXT,
-                screenshot_path TEXT,
-                order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                bill_number TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         self.conn.commit()
     
-    def add_order(self, user_id, username, full_name, group, phone, product_name, quantity, total):
+    def create_order(self, user_id, username, full_name, group, phone, 
+                    product_name, quantity, amount, total, currency):
+        """Create new order and return order_id"""
+        bill_number = f"BOOK{datetime.now().strftime('%Y%m%d%H%M%S')}{user_id}"
+        
         self.cursor.execute('''
             INSERT INTO orders 
-            (user_id, username, full_name, student_group, phone, product_name, quantity, total_amount)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, username, full_name, group, phone, product_name, quantity, total))
+            (user_id, username, full_name, student_group, phone, 
+             product_name, quantity, amount, total_amount, currency, bill_number)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, username, full_name, group, phone, 
+              product_name, quantity, amount, total, currency, bill_number))
+        
         order_id = self.cursor.lastrowid
         self.conn.commit()
-        return order_id
+        return order_id, bill_number
     
-    def update_khqr_data(self, order_id, khqr_data, khqr_md5):
+    def save_khqr_data(self, order_id, khqr_data, khqr_md5):
+        """Save KHQR data to order"""
         self.cursor.execute('''
-            UPDATE orders SET khqr_data = ?, khqr_md5 = ? WHERE id = ?
+            UPDATE orders SET khqr_data = ?, khqr_md5 = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
         ''', (khqr_data, khqr_md5, order_id))
         self.conn.commit()
     
-    def update_screenshot(self, order_id, screenshot_path):
+    def update_payment_status(self, md5_hash, status):
+        """Update payment status when verified"""
         self.cursor.execute('''
-            UPDATE orders SET payment_status = 'uploaded', screenshot_path = ? WHERE id = ?
-        ''', (screenshot_path, order_id))
+            UPDATE orders SET payment_status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE khqr_md5 = ?
+        ''', (status, md5_hash))
         self.conn.commit()
+        return self.cursor.rowcount > 0
+    
+    def get_order_by_md5(self, md5_hash):
+        """Get order by MD5 hash"""
+        self.cursor.execute('SELECT * FROM orders WHERE khqr_md5 = ?', (md5_hash,))
+        row = self.cursor.fetchone()
+        if row:
+            columns = [desc[0] for desc in self.cursor.description]
+            return dict(zip(columns, row))
+        return None
     
     def get_user_orders(self, user_id):
-        self.cursor.execute('SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC', (user_id,))
+        """Get all orders for a user"""
+        self.cursor.execute('''
+            SELECT id, product_name, quantity, total_amount, currency, 
+                   payment_status, created_at
+            FROM orders 
+            WHERE user_id = ? 
+            ORDER BY created_at DESC
+            LIMIT 10
+        ''', (user_id,))
         return self.cursor.fetchall()
     
-    def get_order(self, order_id):
-        self.cursor.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
-        return self.cursor.fetchone()
+    def get_pending_orders(self):
+        """Get all pending orders"""
+        self.cursor.execute('''
+            SELECT id, khqr_md5, user_id, total_amount, created_at
+            FROM orders 
+            WHERE payment_status = 'pending' 
+            ORDER BY created_at ASC
+            LIMIT 20
+        ''')
+        return self.cursor.fetchall()
 
 db = SimpleDB()
 
-# ===================== KHQR PAYMENT GENERATION =====================
+# ===================== KHQR PAYMENT SYSTEM =====================
 class KHQRPayment:
     def __init__(self):
         self.token = BAKONG_TOKEN
@@ -170,59 +217,75 @@ class KHQRPayment:
         
         if KHQR_AVAILABLE and self.token:
             try:
+                # CORRECT: Create instance with token
                 self.khqr_instance = KHQR(self.token)
-                print("✅ KHQR instance created successfully")
+                print(f"✅ KHQR instance created with token: {self.token[:20]}...")
             except Exception as e:
-                print(f"⚠️  Failed to create KHQR instance: {e}")
+                print(f"❌ Failed to create KHQR instance: {e}")
                 self.khqr_instance = None
+        else:
+            print(f"⚠️  KHQR Status - Available: {KHQR_AVAILABLE}, Token: {'Yes' if self.token else 'No'}")
     
-    def generate_real_khqr(self, order_id: int, amount: float, phone: str = "85512345678") -> Tuple[str, str, Image.Image]:
-        """Generate real KHQR code using bakong-khqr library"""
+    def create_khqr_payment(self, order_id, bill_number, amount, currency="USD"):
+        """Create real KHQR payment using bakong_khqr library"""
+        if not self.khqr_instance:
+            raise Exception("KHQR not initialized. Check BAKONG_TOKEN.")
+        
         try:
-            if not self.khqr_instance:
-                raise Exception("KHQR not initialized. Check BAKONG_TOKEN.")
+            print(f"🔄 Creating KHQR for order #{order_id}, amount: ${amount} {currency}")
             
-            print(f"🔧 Generating KHQR for order #{order_id}, amount: ${amount}")
+            # Convert amount for KHQR (KHQR uses smallest unit, e.g., cents for USD)
+            if currency == "USD":
+                # Convert to cents (multiply by 100)
+                khqr_amount = int(amount * 100)
+                khqr_currency = "USD"
+            else:
+                khqr_amount = int(amount)
+                khqr_currency = currency
             
-            # Generate QR data
+            print(f"   Amount in KHQR: {khqr_amount} {khqr_currency}")
+            
+            # Create QR code data - CORRECT METHOD CALL
             qr_data = self.khqr_instance.create_qr(
-                bank_account='sin_soktep@bkrt',  # ⚠️ CHANGE THIS to your actual Bakong account
-                merchant_name='Pu-Tephh M3',
-                merchant_city='Phnom Penh',
-                amount=amount,
-                currency='USD',
-                store_label='Telegram Book Shop',
-                phone_number=phone,
-                bill_number=f'BOOK{order_id:06d}',
-                terminal_label=f'Order_{order_id}',
-                static=False
+                bank_account=BAKONG_ACCOUNT,
+                merchant_name=MERCHANT_NAME,
+                merchant_city=MERCHANT_CITY,
+                amount=khqr_amount,
+                currency=khqr_currency,
+                store_label=STORE_LABEL,
+                phone_number=PHONE_NUMBER,
+                bill_number=bill_number,
+                terminal_label=f"Order#{order_id}",
+                static=False  # Dynamic QR code
             )
             
-            print(f"✅ KHQR data generated: {qr_data[:50]}...")
+            print(f"✅ KHQR data generated (first 100 chars): {qr_data[:100]}...")
             
-            # Generate MD5 hash
+            # Generate MD5 hash for verification
             md5_hash = self.khqr_instance.generate_md5(qr_data)
             print(f"✅ MD5 hash: {md5_hash}")
             
             # Generate QR image
             try:
-                qr_image_path = self.khqr_instance.qr_image(qr_data, output_path=f"payment_images/khqr_{order_id}.png")
+                # Try to generate image using the library
+                qr_image_path = self.khqr_instance.qr_image(qr_data)
+                print(f"✅ QR image generated at: {qr_image_path}")
                 qr_image = Image.open(qr_image_path)
-                print(f"✅ QR image saved: {qr_image_path}")
             except Exception as img_error:
-                print(f"⚠️  Could not generate KHQR image: {img_error}")
-                # Create simple QR as fallback
-                qr_image = self.create_simple_qr(qr_data, order_id, amount)
+                print(f"⚠️  Could not generate KHQR image, using fallback: {img_error}")
+                qr_image = self._create_fallback_qr(qr_data)
             
             return qr_data, md5_hash, qr_image
             
         except Exception as e:
-            print(f"❌ KHQR generation error: {e}")
-            # Fallback to simple QR
-            return self.generate_fallback_qr(order_id, amount)
+            print(f"❌ KHQR creation error: {str(e)}")
+            # Print full traceback for debugging
+            import traceback
+            traceback.print_exc()
+            raise
     
-    def create_simple_qr(self, qr_data: str, order_id: int, amount: float) -> Image.Image:
-        """Create a simple QR code from the KHQR data"""
+    def _create_fallback_qr(self, qr_data):
+        """Create fallback QR code if library fails"""
         qr = qrcode.QRCode(
             version=1,
             error_correction=qrcode.constants.ERROR_CORRECT_L,
@@ -233,66 +296,113 @@ class KHQRPayment:
         qr.make(fit=True)
         return qr.make_image(fill_color="black", back_color="white")
     
-    def generate_fallback_qr(self, order_id: int, amount: float) -> Tuple[str, str, Image.Image]:
-        """Generate fallback QR code when KHQR fails"""
-        print(f"🔄 Using fallback QR for order #{order_id}")
+    def check_payment_status(self, md5_hash):
+        """Check if payment is completed"""
+        if not self.khqr_instance:
+            return "KHQR_NOT_AVAILABLE"
         
-        # Create simple payment info
-        payment_info = f"""
-        Book Shop Payment
-        Order: #{order_id}
-        Amount: ${amount:.2f}
-        Date: {datetime.now().strftime("%Y-%m-%d %H:%M")}
-        Status: Pending
-        Please upload screenshot after payment.
-        """
-        
-        # Generate QR code
-        qr = qrcode.QRCode(
-            version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_L,
-            box_size=10,
-            border=4,
-        )
-        qr.add_data(payment_info)
-        qr.make(fit=True)
-        
-        qr_image = qr.make_image(fill_color="black", back_color="white")
-        
-        # Create simple MD5-like hash
-        md5_hash = hashlib.md5(f"order_{order_id}_{amount}_{datetime.now().timestamp()}".encode()).hexdigest()[:16]
-        
-        return payment_info, f"FALLBACK_{md5_hash}", qr_image
+        try:
+            print(f"🔄 Checking payment status for MD5: {md5_hash[:12]}...")
+            status = self.khqr_instance.check_payment(md5_hash)
+            print(f"✅ Payment status: {status}")
+            return status
+        except Exception as e:
+            print(f"❌ Payment check error: {e}")
+            return "CHECK_ERROR"
 
-# Initialize payment handler
-khqr_payment = KHQRPayment()
+# Initialize payment system
+payment_system = KHQRPayment()
+
+# ===================== BACKGROUND PAYMENT CHECKER =====================
+async def check_payments_background(context: ContextTypes.DEFAULT_TYPE):
+    """Background task to check payment status"""
+    try:
+        print(f"\n🔄 [{datetime.now().strftime('%H:%M:%S')}] Checking pending payments...")
+        
+        pending_orders = db.get_pending_orders()
+        print(f"   Found {len(pending_orders)} pending orders")
+        
+        for order in pending_orders:
+            order_id, md5_hash, user_id, amount, created_at = order
+            
+            if not md5_hash or md5_hash == 'None':
+                continue
+            
+            print(f"   Checking order #{order_id}, MD5: {md5_hash[:12]}...")
+            
+            # Check payment status
+            status = payment_system.check_payment_status(md5_hash)
+            
+            if status == "PAID":
+                print(f"   ✅ Order #{order_id} PAID! Updating database...")
+                db.update_payment_status(md5_hash, 'paid')
+                
+                # Notify user
+                try:
+                    message = f"""
+🎉 **ការទូទាត់របស់អ្នកបានជោគជ័យ!**
+
+🆔 លេខការបញ្ជាទិញ: #{order_id}
+💰 ចំនួនទឹកប្រាក់: ${amount:.2f}
+✅ ស្ថានភាព: បានទូទាត់
+🕒 ពេលវេលា: {datetime.now().strftime('%H:%M:%S')}
+
+សូមអរគុណសម្រាប់ការទិញ!
+"""
+                    await context.bot.send_message(chat_id=user_id, text=message)
+                    print(f"   ✅ Notified user {user_id}")
+                except Exception as e:
+                    print(f"   ❌ Failed to notify user {user_id}: {e}")
+            
+            elif status == "UNPAID":
+                print(f"   ⏳ Order #{order_id} still unpaid")
+            
+            # Small delay between API calls
+            await asyncio.sleep(1)
+        
+        print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Payment check completed")
+        
+    except Exception as e:
+        print(f"❌ Error in background check: {e}")
 
 # ===================== BOT HANDLERS =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user = update.effective_user
     
-    # Check if KHQR is available
-    khqr_status = "✅" if KHQR_AVAILABLE and BAKONG_TOKEN else "❌"
+    # Check KHQR status
+    if payment_system.khqr_instance:
+        khqr_status = "✅ REAL KHQR"
+    elif KHQR_AVAILABLE and BAKONG_TOKEN:
+        khqr_status = "⚠️  Setup Issue"
+    else:
+        khqr_status = "❌ Not Configured"
     
     welcome_msg = f"""👋 សួស្តី {user.first_name}!
 
 📚 **ស្វាគមន៍មកកាន់ហាងសៀវភៅសម្រាប់មិត្តរួមថ្នាក់**
 
-💳 **ប្រព័ន្ធទូទាត់:** {khqr_status} KHQR
-    
+💳 **ប្រព័ន្ធទូទាត់:** {khqr_status}
+🔄 **ការផ្ទៀងផ្ទាត់:** ដោយស្វ័យប្រវត្តិ
+
 **សៀវភៅទាំងអស់៖**
-1. សៀវភៅគណិតវិទ្យា - $1.70
-2. Human & Society - $1.99
-3. គោលការណ៍អាជីវកម្ម - $1.99
-4. សៀវភៅកុំព្យូទ័រ - $2.50
+• សៀវភៅគណិតវិទ្យា - $1.70
+• Human & Society - $1.99
+• គោលការណ៍អាជីវកម្ម - $1.99
+• សៀវភៅកុំព្យូទ័រ - $2.50
+
+**របៀបបញ្ជាទិញ៖**
+1. ជ្រើសរើសសៀវភៅ
+2. បញ្ចូលចំនួន
+3. បំពេញព័ត៌មាន
+4. ស្កេនកូដ KHQR និងទូទាត់
+5. រង់ចាំការបញ្ជាក់ដោយស្វ័យប្រវត្តិ
 """
     
     keyboard = [
-        [InlineKeyboardButton("📚 មើលសៀវភៅ", callback_data="catalog")],
         [InlineKeyboardButton("🛒 បញ្ជាទិញឥឡូវនេះ", callback_data="order")],
         [InlineKeyboardButton("📋 ការបញ្ជាទិញរបស់ខ្ញុំ", callback_data="my_orders")],
-        [InlineKeyboardButton("⚙️ ពិនិត្យស្ថានភាព", callback_data="check_status")]
+        [InlineKeyboardButton("🔄 ពិនិត្យទូទាត់", callback_data="check_my_payments")]
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -408,7 +518,7 @@ async def get_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ **ក្រុម៖** {group}\n\n"
         "📱 **លេខទូរស័ព្ទ (មិនចាំបាច់)៖**\n"
-        "បញ្ចូលលេខទូរស័ព្ទ ឬសរសេរ 'skip' ដើម្បីលោត៖"
+        "បញ្ចូលលេខទូរស័ព្ទ ឬសរសេរ 'skip'៖"
     )
     return GET_PHONE
 
@@ -417,7 +527,7 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     
     if phone.lower() == 'skip':
-        phone = "85500000000"  # Default phone
+        phone = ""
     
     context.user_data['phone'] = phone
     
@@ -438,9 +548,9 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 👤 ព័ត៌មាន៖
 ឈ្មោះ៖ {name}
 ក្រុម៖ {group}
-ទូរស័ព្ទ៖ {phone if phone != "85500000000" else 'មិនបានផ្តល់'}
+ទូរស័ព្ទ៖ {phone if phone else 'មិនបានផ្តល់'}
 
-💳 ចុចប៊ូតុងខាងក្រោមដើម្បីបង្កើតកូដទូទាត់៖
+💳 ចុចប៊ូតុងខាងក្រោមដើម្បីបង្កើតកូដទូទាត់ KHQR៖
 """
     
     keyboard = [
@@ -453,7 +563,7 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return PAYMENT
 
 async def generate_khqr_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate KHQR code for payment - FIXED VERSION"""
+    """Generate REAL KHQR payment code"""
     query = update.callback_query
     await query.answer()
     
@@ -464,13 +574,13 @@ async def generate_khqr_payment(update: Update, context: ContextTypes.DEFAULT_TY
         total = context.user_data['total']
         name = context.user_data['name']
         group = context.user_data['group']
-        phone = context.user_data.get('phone', '85500000000')
+        phone = context.user_data.get('phone', '')
         
         # Show generating message
-        await query.edit_message_text("🔄 **កំពុងបង្កើតកូដ KHQR...**\n\nសូមរង់ចាំបន្តិច។")
+        await query.edit_message_text("🔄 **កំពុងបង្កើតកូដ KHQR...**\n\nសូមរង់ចាំ។")
         
-        # Save order to database first
-        order_id = db.add_order(
+        # Create order in database
+        order_id, bill_number = db.create_order(
             user.id,
             user.username or "",
             name,
@@ -478,20 +588,24 @@ async def generate_khqr_payment(update: Update, context: ContextTypes.DEFAULT_TY
             phone,
             product['name_kh'],
             quantity,
-            total
+            product['price'],
+            total,
+            product['currency']
         )
         
-        print(f"📝 Created order #{order_id} for user {user.id}")
+        print(f"📝 Created order #{order_id} with bill #{bill_number}")
         
-        # Generate KHQR
-        print(f"🔧 Starting KHQR generation for order #{order_id}")
-        qr_data, md5_hash, qr_image = khqr_payment.generate_real_khqr(order_id, total, phone)
+        # Generate REAL KHQR
+        qr_data, md5_hash, qr_image = payment_system.create_khqr_payment(
+            order_id, bill_number, total, product['currency']
+        )
         
         # Save KHQR data to database
-        db.update_khqr_data(order_id, qr_data, md5_hash)
+        db.save_khqr_data(order_id, qr_data, md5_hash)
         
-        # Store order ID in context
+        # Store order ID and MD5 in context
         context.user_data['order_id'] = order_id
+        context.user_data['md5_hash'] = md5_hash
         
         # Convert image to bytes for Telegram
         bio = BytesIO()
@@ -505,25 +619,25 @@ async def generate_khqr_payment(update: Update, context: ContextTypes.DEFAULT_TY
 🔢 ចំនួន៖ {quantity}
 💰 ចំនួនទឹកប្រាក់៖ **${total:.2f}**
 📝 លេខការបញ្ជាទិញ៖ **#{order_id}**
+🔗 លេខវិក័យប័ត្រ៖ {bill_number}
 
-⬇️ **សូមស្កេនកូដ QR ខាងក្រោម៖**
+⬇️ **សូមស្កេនកូដ KHQR ខាងក្រោម៖**
 
 ⚠️ **របៀបទូទាត់៖**
 1. បើកកម្មវិធី **Bakong**
-2. ស្កេនកូដ QR
+2. ស្កេនកូដ KHQR
 3. បញ្ជាក់ការទូទាត់
-4. **ថតរូបភាពអេក្រង់**
-5. ផ្ញើរូបភាពមកទីនេះ
+4. ប្រព័ន្ធនឹងផ្ទៀងផ្ទាត់ដោយស្វ័យប្រវត្តិ
 
-📸 **បន្ទាប់ពីទូទាត់ សូមផ្ញើរូបភាពមកខ្ញុំ!**
+⏳ **ការផ្ទៀងផ្ទាត់៖**
+• ប្រព័ន្ធពិនិត្យរៀងរាល់ ៣០ វិនាទី
+• អ្នកនឹងទទួលបានការបញ្ជាក់ដោយស្វ័យប្រវត្តិ
+• មិនចាំបាច់ធ្វើអ្វីទៀតទេ
 """
         
-        # Add debug info if using fallback
-        if md5_hash.startswith("FALLBACK_"):
-            payment_msg += "\n\n⚠️ **សំគាល់៖** ប្រើប្រព័ន្ធទូទាត់ជំនួស។"
-        
         keyboard = [
-            [InlineKeyboardButton("📸 ផ្ញើរូបភាពការទូទាត់", callback_data="upload_screenshot")],
+            [InlineKeyboardButton("🔄 ពិនិត្យស្ថានភាព", callback_data=f"check_{md5_hash}")],
+            [InlineKeyboardButton("📋 ការបញ្ជាទិញរបស់ខ្ញុំ", callback_data="my_orders")],
             [InlineKeyboardButton("🏠 ទៅផ្ទះ", callback_data="main_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -534,25 +648,23 @@ async def generate_khqr_payment(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=reply_markup
         )
         
-        print(f"✅ Successfully sent KHQR for order #{order_id}")
+        print(f"✅ KHQR sent for order #{order_id}")
         
-        return UPLOAD_SCREENSHOT
+        # Schedule auto-check in 30 seconds
+        await asyncio.sleep(30)
+        await auto_check_payment(update, context, md5_hash)
+        
+        return WAITING_PAYMENT
         
     except Exception as e:
-        print(f"❌ Error in generate_khqr_payment: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Error generating KHQR: {str(e)}")
         
-        # Send error message to user
         error_msg = f"""
-❌ **មានបញ្ហាក្នុងការបង្កើតកូដទូទាត់**
+❌ **មិនអាចបង្កើតកូដ KHQR បាន**
 
 កំហុស៖ {str(e)}
 
-សូម៖
-1. ព្យាយាមម្តងទៀត
-2. ទាក់ទងអ្នកគ្រប់គ្រង
-3. ប្រើប្រព័ន្ធទូទាត់ផ្សេង
+សូមព្យាយាមម្តងទៀត ឬទាក់ទងអ្នកគ្រប់គ្រង។
 """
         
         keyboard = [
@@ -561,85 +673,141 @@ async def generate_khqr_payment(update: Update, context: ContextTypes.DEFAULT_TY
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        if query:
-            await query.edit_message_text(error_msg, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text(error_msg, reply_markup=reply_markup)
-        
+        await query.edit_message_text(error_msg, reply_markup=reply_markup)
         return CHOOSING
 
-async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle uploaded screenshot"""
-    if not update.message or not update.message.photo:
-        await update.message.reply_text("❌ សូមផ្ញើរូបភាពអេក្រង់។")
-        return UPLOAD_SCREENSHOT
+async def auto_check_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, md5_hash):
+    """Auto-check payment after 30 seconds"""
+    try:
+        status = payment_system.check_payment_status(md5_hash)
+        order = db.get_order_by_md5(md5_hash)
+        
+        if status == "PAID" and order:
+            db.update_payment_status(md5_hash, 'paid')
+            
+            message = f"""
+✅ **ការទូទាត់បានជោគជ័យ!**
+
+អ្នកបានទូទាត់សម្រាប់ការបញ្ជាទិញ #{order['id']}
+សូមអរគុណសម្រាប់ការទិញ!
+"""
+            try:
+                await context.bot.send_message(chat_id=order['user_id'], text=message)
+            except:
+                pass
+    except:
+        pass
+
+async def check_payment_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check payment status manually"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Extract MD5 from callback data
+    if query.data.startswith("check_"):
+        md5_hash = query.data.replace("check_", "")
+    else:
+        md5_hash = context.user_data.get('md5_hash', '')
+    
+    if not md5_hash:
+        await query.edit_message_text("❌ រកមិនឃើញលេខកូដទូទាត់ទេ។")
+        return
     
     try:
-        # Get the photo
-        photo = update.message.photo[-1]
-        file = await photo.get_file()
+        await query.edit_message_text("🔄 **កំពុងពិនិត្យស្ថានភាពទូទាត់...**")
         
-        # Save screenshot
-        order_id = context.user_data.get('order_id', 'unknown')
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"payment_images/screenshot_{order_id}_{timestamp}.jpg"
+        status = payment_system.check_payment_status(md5_hash)
+        order = db.get_order_by_md5(md5_hash)
         
-        await file.download_to_drive(filename)
-        
-        # Update order status
-        if 'order_id' in context.user_data:
-            db.update_screenshot(context.user_data['order_id'], filename)
-        
-        # Notify user
-        await update.message.reply_text(
-            "✅ **រូបភាពត្រូវបានទទួល!**\n\n"
-            "អ្នកគ្រប់គ្រងនឹងពិនិត្យរូបភាពការទូទាត់របស់អ្នក។\n"
-            "យើងនឹងទំនាក់ទំនងអ្នកវិញក្នុងពេលឆាប់ៗនេះ។\n\n"
-            "🙏 សូមអរគុណ!"
-        )
-        
-        # Notify admins
-        order_info = f"""
-📢 **ការបញ្ជាទិញថ្មីត្រូវបានផ្ញើរូបភាព!**
+        if status == "PAID":
+            db.update_payment_status(md5_hash, 'paid')
+            
+            message = f"""
+🎉 **ការទូទាត់របស់អ្នកបានជោគជ័យ!**
 
-🆔 លេខការបញ្ជាទិញ: #{order_id}
-👤 អ្នកទិញ: {context.user_data.get('name', 'N/A')}
-🎓 ក្រុម: {context.user_data.get('group', 'N/A')}
-📘 សៀវភៅ: {context.user_data.get('product', {}).get('name_kh', 'N/A')}
-💰 ចំនួនទឹកប្រាក់: ${context.user_data.get('total', 0):.2f}
+🆔 លេខការបញ្ជាទិញ: #{order['id'] if order else 'N/A'}
+💰 ចំនួនទឹកប្រាក់: ${order['total_amount'] if order else 0:.2f}
+✅ ស្ថានភាព: បានទូទាត់
+
+សូមអរគុណសម្រាប់ការទិញ!
+"""
+        elif status == "UNPAID":
+            message = f"""
+⏳ **ការទូទាត់មិនទាន់បានបញ្ចប់**
+
+🆔 លេខការបញ្ជាទិញ: #{order['id'] if order else 'N/A'}
+💰 ចំនួនទឹកប្រាក់: ${order['total_amount'] if order else 0:.2f}
+❌ ស្ថានភាព: មិនទាន់ទូទាត់
+
+សូមស្កេនកូដ KHQR និងទូទាត់។
+"""
+        else:
+            message = f"""
+⚠️ **មិនអាចពិនិត្យស្ថានភាពបាន**
+
+ស្ថានភាព: {status}
+សូមព្យាយាមម្តងទៀតក្រោយមក។
 """
         
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(chat_id=admin_id, text=order_info)
-                
-                # Send screenshot
-                with open(filename, 'rb') as photo_file:
-                    await context.bot.send_photo(
-                        chat_id=admin_id,
-                        photo=photo_file,
-                        caption=f"📸 រូបភាពសម្រាប់ការបញ្ជាទិញ #{order_id}"
-                    )
-                
-            except Exception as e:
-                print(f"Failed to notify admin {admin_id}: {e}")
-        
-        # Clear context
-        context.user_data.clear()
-        
         keyboard = [
-            [InlineKeyboardButton("🏠 ទៅផ្ទះ", callback_data="main_menu")],
-            [InlineKeyboardButton("📋 ការបញ្ជាទិញរបស់ខ្ញុំ", callback_data="my_orders")]
+            [InlineKeyboardButton("🔄 ពិនិត្យម្តងទៀត", callback_data=f"check_{md5_hash}")],
+            [InlineKeyboardButton("📋 ការបញ្ជាទិញរបស់ខ្ញុំ", callback_data="my_orders")],
+            [InlineKeyboardButton("🏠 ទៅផ្ទះ", callback_data="main_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await update.message.reply_text("អ្វីបន្ទាប់?", reply_markup=reply_markup)
-        return CHOOSING
+        await query.edit_message_text(message, reply_markup=reply_markup)
         
     except Exception as e:
-        print(f"Error handling screenshot: {e}")
-        await update.message.reply_text("❌ មានបញ្ហាក្នុងការទទួលរូបភាព។")
-        return UPLOAD_SCREENSHOT
+        print(f"❌ Error checking payment: {e}")
+        await query.edit_message_text("❌ មិនអាចពិនិត្យស្ថានភាពបាន។ សូមព្យាយាមម្តងទៀត។")
+
+async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user's orders"""
+    query = update.callback_query
+    if query:
+        await query.answer()
+        user_id = query.from_user.id
+    else:
+        user_id = update.effective_user.id
+    
+    orders = db.get_user_orders(user_id)
+    
+    if not orders:
+        msg = "📭 អ្នកមិនទាន់មានការបញ្ជាទិញណាមួយទេ។"
+        if query:
+            await query.edit_message_text(msg)
+        else:
+            await update.message.reply_text(msg)
+        return CHOOSING
+    
+    orders_msg = "📋 **ការបញ្ជាទិញរបស់អ្នក៖**\n\n"
+    
+    for order in orders:
+        order_id, product_name, quantity, total, currency, status, created_at = order
+        
+        status_emoji = {
+            'pending': '⏳',
+            'paid': '✅',
+            'expired': '❌'
+        }.get(status, '❓')
+        
+        orders_msg += f"**#{order_id}** - {product_name}\n"
+        orders_msg += f"{status_emoji} ស្ថានភាព: {status}\n"
+        orders_msg += f"🔢 ចំនួន: {quantity}\n"
+        orders_msg += f"💰 តម្លៃ: ${total:.2f}\n"
+        orders_msg += f"📅 កាលបរិច្ឆេទ: {created_at[:10]}\n\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("🛒 បញ្ជាទិញថ្មី", callback_data="order")],
+        [InlineKeyboardButton("🏠 ទៅផ្ទះ", callback_data="main_menu")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if query:
+        await query.edit_message_text(orders_msg, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(orders_msg, reply_markup=reply_markup)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle callback queries"""
@@ -651,60 +819,82 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "main_menu":
         await start(update, context)
         return CHOOSING
-    elif data == "catalog":
-        await show_catalog(update, context)
-        return CHOOSING
     elif data == "order":
         return await start_order(update, context)
+    elif data == "my_orders":
+        await show_my_orders(update, context)
+        return CHOOSING
+    elif data == "check_my_payments":
+        await query.edit_message_text("🔄 កំពុងពិនិត្យទូទាត់ទាំងអស់...")
+        await check_payments_background(context)
+        await query.edit_message_text("✅ បានពិនិត្យទូទាត់ទាំងអស់!")
+        return CHOOSING
+    elif data.startswith("select_"):
+        return await select_product(update, context)
     elif data == "generate_khqr":
         return await generate_khqr_payment(update, context)
-    elif data == "upload_screenshot":
-        await query.message.reply_text("📸 សូមផ្ញើរូបភាពអេក្រង់ការទូទាត់៖")
-        return UPLOAD_SCREENSHOT
+    elif data.startswith("check_"):
+        await check_payment_status(update, context)
+        return WAITING_PAYMENT
     
     return CHOOSING
 
 # ===================== MAIN FUNCTION =====================
 def main():
     """Start the bot"""
-    print("=" * 50)
-    print("🤖 Telegram Book Shop Bot")
-    print("=" * 50)
+    print("=" * 60)
+    print("🤖 Telegram Book Shop Bot with REAL KHQR Payments")
+    print("=" * 60)
     
-    # Check requirements
-    print(f"📦 KHQR Available: {KHQR_AVAILABLE}")
-    print(f"🔑 BAKONG_TOKEN set: {'✅' if BAKONG_TOKEN else '❌'}")
-    print(f"🤖 TELEGRAM_TOKEN set: {'✅' if TOKEN and TOKEN != 'YOUR_BOT_TOKEN_HERE' else '❌'}")
+    # Debug info
+    print(f"🔧 DEBUG INFO:")
+    print(f"   Python Version: {os.sys.version}")
+    print(f"   KHQR Available: {KHQR_AVAILABLE}")
+    print(f"   BAKONG_TOKEN: {'Set' if BAKONG_TOKEN else 'NOT SET'}")
+    print(f"   BAKONG_ACCOUNT: {BAKONG_ACCOUNT}")
     
     if not KHQR_AVAILABLE:
-        print("\n⚠️  WARNING: bakong-khqr library not installed!")
-        print("   Install with: pip install bakong-khqr[image]")
-        print("   Or using fallback QR system")
+        print("\n❌ ERROR: bakong_khqr library not found!")
+        print("   Run: pip3 install bakong-khqr")
+        print("   Or: pip3 install bakong-khqr[image] (for QR images)")
     
     if not BAKONG_TOKEN:
-        print("\n⚠️  WARNING: BAKONG_TOKEN not set!")
+        print("\n⚠️  WARNING: No BAKONG_TOKEN!")
         print("   Get token from: https://api-bakong.nbc.gov.kh/register/")
-        print("   Or use RBK Token from: https://bakongrelay.com/")
-        print("   Will use fallback system")
+        print("   Or use RBK Token: https://bakongrelay.com/")
     
     # Create application
     try:
         application = Application.builder().token(TOKEN).build()
         
-        # Add handlers
-        application.add_handler(CommandHandler('start', start))
+        # Add job queue for background payment checks
+        job_queue = application.job_queue
+        if job_queue:
+            job_queue.run_repeating(check_payments_background, interval=30, first=10)
+            print("✅ Background checker: Every 30 seconds")
+        
+        # Add conversation handler
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler('start', start)],
+            states={
+                CHOOSING: [CallbackQueryHandler(handle_callback)],
+                SELECT_PRODUCT: [CallbackQueryHandler(handle_callback)],
+                GET_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_quantity)],
+                GET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
+                GET_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_group)],
+                GET_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
+                PAYMENT: [CallbackQueryHandler(handle_callback)],
+                WAITING_PAYMENT: [CallbackQueryHandler(handle_callback)]
+            },
+            fallbacks=[CommandHandler('start', start)]
+        )
+        
+        application.add_handler(conv_handler)
         application.add_handler(CallbackQueryHandler(handle_callback))
         
-        # Message handlers
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, get_quantity), group=1)
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, get_name), group=2)
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, get_group), group=3)
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone), group=4)
-        application.add_handler(MessageHandler(filters.PHOTO, handle_screenshot), group=5)
-        
         print("\n🚀 Bot is starting...")
-        print("📚 Products loaded:", len(PRODUCTS))
-        print("👑 Admin IDs:", ADMIN_IDS)
+        print("💳 Payment: REAL KHQR with auto MD5 verification")
+        print("=" * 60)
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
         
